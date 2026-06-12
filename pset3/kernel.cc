@@ -59,19 +59,22 @@ void kernel_start(const char* command) {
 
     // clear screen
     console_clear();
+    int perm;
 
     // (re-)initialize kernel page table
-    for (uintptr_t addr = 0; addr < MEMSIZE_PHYSICAL; addr += PAGESIZE) {
-        int perm = PTE_P | PTE_W | PTE_U;
-        if (addr == 0) {
-            // nullptr is inaccessible even to the kernel
-            perm = 0;
-        }
-        // install identity mapping
-        int r = vmiter(kernel_pagetable, addr).try_map(addr, perm);
-        assert(r == 0); // mappings during kernel_start MUST NOT fail
-                        // (Note that later mappings might fail!!)
+     // (re-)initialize kernel page table
+   for (vmiter it(kernel_pagetable, 0);
+     it.va() < MEMSIZE_PHYSICAL;
+     it += PAGESIZE) {
+    if (it.va() == 0) {
+        it.map(it.va(), 0);
+    } else if (it.va() == CONSOLE_ADDR) {
+        it.map(it.va(), PTE_P | PTE_W | PTE_U);
+    } else if (it.va() < PROC_START_ADDR){
+        it.map(it.va(), PTE_P | PTE_W);
     }
+    else it.map(it.va(), PTE_P | PTE_W | PTE_U);
+}
 
     // set up process descriptors
     for (pid_t i = 0; i < MAXNPROC; i++) {
@@ -120,7 +123,7 @@ void* kalloc(size_t sz) {
     }
 
     int pageno = 0;
-    int page_increment = 1;
+    int page_increment = 3;
     // In the handout code, `kalloc` returns the first free page.
     // Alternate search strategies can be faster and/or expose bugs elsewhere.
     // This initialization returns a random free page:
@@ -166,45 +169,77 @@ void kfree(void* kptr) {
 void process_setup(pid_t pid, const char* program_name) {
     init_process(&ptable[pid], 0);
 
-    // initialize process page table
-    ptable[pid].pagetable = kernel_pagetable;
+    x86_64_pagetable* page_table = kalloc_pagetable();
+    assert(page_table != nullptr);
+    ptable[pid].pagetable = page_table;
 
-    // obtain reference to program image
-    // (The program image models the process executable.)
+    // Copy kernel mappings below PROC_START_ADDR.
+    for (vmiter kit(kernel_pagetable, 0), pit(page_table, 0);
+         pit.va() < PROC_START_ADDR;
+         kit += PAGESIZE, pit += PAGESIZE) {
+        if (kit.present()) {
+            int r = pit.try_map(kit.pa(), kit.perm());
+            assert(r == 0);
+        }
+    }
+
+
+    // Obtain reference to program image.
     program_image pgm(program_name);
 
-    // allocate and map process memory as specified in program image
+    // Allocate and map process memory.
     for (auto seg = pgm.begin(); seg != pgm.end(); ++seg) {
         for (uintptr_t a = round_down(seg.va(), PAGESIZE);
              a < seg.va() + seg.size();
              a += PAGESIZE) {
-            // `a` is the process virtual address for the next code/data page
-            // (The handout code requires that the corresponding physical
-            // address is currently free.)
-            assert(physpages[a / PAGESIZE].refcount == 0);
-            ++physpages[a / PAGESIZE].refcount;
+
+            uintptr_t pa = (uintptr_t) kalloc(PAGESIZE);
+            assert(pa != 0);
+            int perm = PTE_P | PTE_U;
+            if (seg.writable()) perm |= PTE_W;
+            int r = vmiter(page_table, a).try_map(pa, perm);
+            assert(r == 0);
+            
         }
     }
 
-    // copy instructions and data from program image into process memory
+    // Copy instructions and data into the allocated physical pages.
     for (auto seg = pgm.begin(); seg != pgm.end(); ++seg) {
-        memset(reinterpret_cast<void*>(seg.va()), 0, seg.size());
-        memcpy(reinterpret_cast<void*>(seg.va()), seg.data(), seg.data_size());
+        for (uintptr_t a = round_down(seg.va(), PAGESIZE);
+             a < seg.va() + seg.size();
+             a += PAGESIZE) {
+            vmiter p_it(ptable[pid].pagetable, a);
+            uintptr_t pa = p_it.pa();
+            memset(reinterpret_cast<void*> (p_it.pa()), 0, PAGESIZE);
+        }
+        for (uintptr_t offset =0;  offset< seg.data_size(); ){
+            uintptr_t va = seg.va()+offset; 
+            vmiter it(page_table, va);
+            uintptr_t curr_offset = it.pa() % PAGESIZE;
+            uintptr_t n = PAGESIZE-curr_offset;
+            if (n>seg.data_size()-offset){
+                n = seg.data_size()-offset;
+            }
+            memcpy(reinterpret_cast<void*>(it.pa() + curr_offset), seg.data()+offset, n);
+            offset +=n;
+        }
     }
 
-    // mark entry point
+
+    // Set instruction pointer.
     ptable[pid].regs.reg_rip = pgm.entry();
 
-    // allocate and map stack segment
-    // Compute process virtual address for stack page
-    uintptr_t stack_addr = PROC_START_ADDR + PROC_SIZE * pid - PAGESIZE;
-    // The handout code requires that the corresponding physical address
-    // is currently free.
-    assert(physpages[stack_addr / PAGESIZE].refcount == 0);
-    ++physpages[stack_addr / PAGESIZE].refcount;
-    ptable[pid].regs.reg_rsp = stack_addr + PAGESIZE;
+    // Allocate and map stack.
+  uintptr_t stack_addr = PROC_START_ADDR + PROC_SIZE * pid - PAGESIZE;
 
-    // mark process as runnable
+    uintptr_t stack_page = (uintptr_t)kalloc(PAGESIZE);
+    assert(stack_page !=0);
+    vmiter(page_table, stack_addr)
+    .try_map(stack_page, PTE_P | PTE_W | PTE_U);
+
+ptable[pid].regs.reg_rsp = stack_addr + PAGESIZE;
+
+    // Mark process as runnable.
     ptable[pid].state = P_RUNNABLE;
 }
 
@@ -356,9 +391,21 @@ uintptr_t syscall(regstate* regs) {
 //    in `u-lib.hh` (but in the handout code, it does not).
 
 int syscall_page_alloc(uintptr_t addr) {
-    assert(physpages[addr / PAGESIZE].refcount == 0);
-    ++physpages[addr / PAGESIZE].refcount;
-    memset(reinterpret_cast<void*>(addr), 0, PAGESIZE);
+    if (addr>=MEMSIZE_VIRTUAL || addr<PROC_START_ADDR || addr %PAGESIZE !=0){
+        return -1;
+    }
+    vmiter it(current->pagetable, addr);
+    if (it.present()) return -1;
+    uintptr_t new_page = (uintptr_t)kalloc(PAGESIZE);
+    if (!new_page) return -1;
+    memset(reinterpret_cast<void*>(new_page), 0, PAGESIZE);
+
+ 
+    if (it.try_map(new_page, PTE_P|PTE_W|PTE_U)!=0){
+        kfree(reinterpret_cast<void*>(new_page));
+        return -1;
+    }
+
     return 0;
 }
 
