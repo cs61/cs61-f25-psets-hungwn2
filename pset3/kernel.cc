@@ -156,8 +156,15 @@ void* kalloc(size_t sz) {
 //    If `kptr == nullptr` does nothing.
 
 void kfree(void* kptr) {
-    (void) kptr;
-    assert(false /* your code here */);
+    if (!kptr) return;
+    uintptr_t pa = reinterpret_cast<uintptr_t>(kptr);
+
+    assert(pa % PAGESIZE==0);
+    assert(pa < MEMSIZE_PHYSICAL);
+    // assert(allocatable_physical_address(pa));
+     size_t pn = pa / PAGESIZE;
+    assert(physpages[pn].refcount > 0);
+    --physpages[pa/PAGESIZE].refcount;
 }
 
 
@@ -215,7 +222,7 @@ void process_setup(pid_t pid, const char* program_name) {
         for (uintptr_t offset =0;  offset< seg.data_size(); ){
             uintptr_t va = seg.va()+offset; 
             vmiter it(page_table, va);
-            uintptr_t curr_offset = it.pa() % PAGESIZE;
+            uintptr_t curr_offset = va % PAGESIZE;
             uintptr_t n = PAGESIZE-curr_offset;
             if (n>seg.data_size()-offset){
                 n = seg.data_size()-offset;
@@ -230,14 +237,14 @@ void process_setup(pid_t pid, const char* program_name) {
     ptable[pid].regs.reg_rip = pgm.entry();
 
     // Allocate and map stack.
-  uintptr_t stack_addr = PROC_START_ADDR + PROC_SIZE * pid - PAGESIZE;
+   uintptr_t stack_addr = MEMSIZE_VIRTUAL - PAGESIZE;
 
     uintptr_t stack_page = (uintptr_t)kalloc(PAGESIZE);
     assert(stack_page !=0);
     vmiter(page_table, stack_addr)
     .try_map(stack_page, PTE_P | PTE_W | PTE_U);
 
-ptable[pid].regs.reg_rsp = stack_addr + PAGESIZE;
+    ptable[pid].regs.reg_rsp = stack_addr + PAGESIZE;
 
     // Mark process as runnable.
     ptable[pid].state = P_RUNNABLE;
@@ -322,7 +329,8 @@ void exception(regstate* regs) {
 
 
 int syscall_page_alloc(uintptr_t addr);
-
+int syscall_fork();
+void syscall_exit(proc *current);
 
 // syscall(regs)
 //    Handle a system call initiated by a `syscall` instruction.
@@ -375,6 +383,13 @@ uintptr_t syscall(regstate* regs) {
     case SYSCALL_PAGE_ALLOC:
         return syscall_page_alloc(current->regs.reg_rdi);
 
+    case SYSCALL_FORK:
+        return syscall_fork();
+
+    case SYSCALL_EXIT:
+        syscall_exit(current);
+        schedule();
+
     default:
         proc_panic(current, "Unhandled system call %ld (pid=%d, rip=%p)!\n",
                    regs->reg_rax, current->pid, regs->reg_rip);
@@ -409,6 +424,95 @@ int syscall_page_alloc(uintptr_t addr) {
     return 0;
 }
 
+void destroy_proc(proc * p){
+    if (!p->pagetable){
+        p->state = P_FREE;
+        return;
+    }
+    for (vmiter it(p->pagetable, PROC_START_ADDR); it.va()<MEMSIZE_VIRTUAL; it+=PAGESIZE){
+        if (it.present() && it.user()){
+            kfree((void*)it.pa());
+        }
+    }
+    for (ptiter pit(p->pagetable); pit.va()<MEMSIZE_VIRTUAL; pit.next()){
+        kfree((void*)pit.pa());
+    }
+
+    kfree((void*)p->pagetable);
+    p->pagetable = nullptr;
+    p->state = P_FREE;
+}
+
+int syscall_fork(){
+    pid_t pid = current->pid;
+    int child =-1;
+    for (int i=1; i<MAXNPROC; i++){
+        if (ptable[i].state== P_FREE){
+            child = i;
+            break;
+        }
+    }
+    if (child == -1) return -1;
+
+    proc *child_proc = &ptable[child]; 
+    init_process(child_proc, 0);
+
+    child_proc->pagetable = kalloc_pagetable();
+    if (!child_proc->pagetable){
+        child_proc->state = P_FREE;
+        return -1;
+    }
+
+    for (vmiter pit(current->pagetable, 0), cit(child_proc->pagetable, 0); pit.va()<MEMSIZE_VIRTUAL;     
+        pit += PAGESIZE, cit += PAGESIZE){
+            if (!pit.present()){
+                continue;
+            }
+            if (pit.va()<PROC_START_ADDR){
+                int r = cit.try_map(pit.pa(), pit.perm());
+                if (r<0){
+                    destroy_proc(child_proc);
+                    return -1;
+                }
+            }
+            else if (pit.user()){
+                uintptr_t curr_page;
+
+                if (pit.writable() && pit.va()!= CONSOLE_ADDR){
+                    curr_page = reinterpret_cast<uintptr_t>(kalloc(PAGESIZE));
+                    if (!curr_page){
+                        destroy_proc(child_proc);
+                        return -1;
+                    } 
+                    
+                }
+                else{
+                    curr_page = pit.pa();
+                    physpages[curr_page/PAGESIZE].refcount++;
+                }                  
+                int r = cit.try_map(curr_page, pit.perm());
+                if (r<0){
+                    kfree(reinterpret_cast<void*>(curr_page));
+                    destroy_proc(child_proc);
+                    return -1;
+                }
+                memcpy(reinterpret_cast<void*>(curr_page), reinterpret_cast<void*>(pit.pa()), PAGESIZE);
+
+            }
+
+    }
+    child_proc->state = P_RUNNABLE;
+    child_proc->regs = current->regs;
+    child_proc->regs.reg_rax = 0;
+    return child;
+
+}
+
+
+
+void syscall_exit(proc *current){
+    destroy_proc(current);
+}
 
 // schedule
 //    Pick the next process to run and then run it.
